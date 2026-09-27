@@ -9,7 +9,7 @@ description = "Reliable webhook and event delivery infrastructure"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
-authors = [{ name = "neuralbroker" }]
+authors = [{ name = "sajadinmaker" }]
 keywords = ["webhooks", "events", "fastapi", "postgres", "redis", "reliability"]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -34,9 +34,9 @@ dependencies = [
 test = ["pytest>=8.0", "httpx>=0.27"]
 
 [project.urls]
-Homepage = "https://github.com/neuralbroker/hookflow"
-Repository = "https://github.com/neuralbroker/hookflow"
-Issues = "https://github.com/neuralbroker/hookflow/issues"
+Homepage = "https://github.com/sajadinmaker/hookflow"
+Repository = "https://github.com/sajadinmaker/hookflow"
+Issues = "https://github.com/sajadinmaker/hookflow/issues"
 
 [tool.setuptools]
 packages = ["app"]
