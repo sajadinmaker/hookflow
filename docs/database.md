@@ -18,7 +18,9 @@ the app cannot silently target different databases.
 
 ## Tables
 
-- `endpoints(id, url, secret, rate_limit_per_minute, created_at)`
+- `tenants(id, name UNIQUE, created_at)`
+- `api_keys(id, tenant_id → tenants, key_prefix UNIQUE, key_hash, label, created_at, last_used_at, revoked_at)`
+- `endpoints(id, tenant_id → tenants NOT NULL, url, secret, rate_limit_per_minute, created_at)`
 - `events(id, endpoint_id → endpoints, idempotency_key NULLABLE, payload TEXT raw JSON, created_at)`
 - `deliveries(id, event_id → events, endpoint_id → endpoints, status, attempts,
   next_attempt_at, last_status_code, last_error, latency_ms, created_at, updated_at)`
@@ -42,6 +44,12 @@ with `StringDataRightTruncation` on the first run there. See migration
   would otherwise full-scan on every 2s poll.
 - `INDEX deliveries(endpoint_id, created_at)`, `INDEX deliveries(event_id)`,
   `INDEX events(endpoint_id, created_at)` — history pagination + filters.
+- `INDEX deliveries(claim_token, claimed_at)` — the "unclaimed OR lease expired"
+  half of the worker's claim predicate.
+- `INDEX endpoints(tenant_id)`, `INDEX api_keys(tenant_id)` — tenant scoping on
+  every authorised query.
+- `UNIQUE api_keys(key_prefix)` — one key per prefix, so bearer lookup is a
+  single-row index hit.
 
 ## Migration history
 
@@ -49,6 +57,21 @@ with `StringDataRightTruncation` on the first run there. See migration
 |---|---|
 | `68f2ffddab42` | initial schema: `endpoints`, `events`, `deliveries` |
 | `5d66ae57cfaa` | widen `endpoints.secret` to TEXT for Fernet envelopes |
+| `867af545e9dd` | worker claim lease: `deliveries.claim_token`, `claimed_at`, `ix_deliveries_claim` |
+| `6c7e46e98ca0` | `tenants` + `api_keys`; `endpoints.tenant_id` NOT NULL with backfill |
+
+### The tenant migration is hand-written
+
+`alembic revision --autogenerate` produced `ADD COLUMN tenant_id NOT NULL` with
+no default and no backfill, which fails against any database that already
+contains endpoints. The committed revision instead adds the column nullable,
+creates a `legacy` tenant, backfills existing endpoints onto it, then adds the
+foreign key and enforces `NOT NULL`.
+
+This was verified by migrating a database holding six pre-existing endpoints:
+all six preserved, zero null `tenant_id` remaining, and `NOT NULL` confirmed
+enforced by a rejected insert. Hand-written data migrations are the normal case
+here — autogenerate infers DDL, never data.
 
 ## SQLite is not PostgreSQL
 

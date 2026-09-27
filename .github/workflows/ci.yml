@@ -96,3 +96,22 @@ jobs:
       - uses: actions/checkout@v4
       - name: Docker build check
         run: docker build -f docker/Dockerfile -t hookflow:ci .
+
+  dashboard:
+    # Type-checks and builds the operator UI. No API is needed at build time:
+    # every page is server-rendered on demand and reads the API key from the
+    # server environment, so nothing operational is baked into the bundle.
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: dashboard
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build

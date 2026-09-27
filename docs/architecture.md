@@ -25,5 +25,11 @@ Key decisions:
 7. Schema owned by Alembic, applied as a deploy step — never `create_all` at boot, so replicas cannot race DDL and a missing migration cannot hide.
 8. Webhook secrets encrypted at rest (Fernet envelope) behind a `KeyProvider` seam, plaintext present only while signing. Encryption rather than hashing is forced by the fact that the server must reproduce the secret to sign; see `docs/security.md`.
 
-Known boundary: the worker does not claim the rows it selects, so exactly one
-worker replica is correct today. See the README limitations.
+7. Workers claim what they deliver (lease + atomic claim query), so replicas
+   do not double-deliver. Redis + PostgreSQL required for replica-safe
+   rate limiting.
+8. API-key auth resolves each request to exactly one tenant; queries are
+   filtered by `tenant_id` and cross-tenant access answers 404, not 403.
+
+Known boundaries: the rate limiter is per-process without Redis, and API keys
+cannot expire. See the README limitations.

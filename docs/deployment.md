@@ -46,6 +46,8 @@ purpose.
 | `DATABASE_URL` | `sqlite:///./hookflow.db` | `postgresql+psycopg://...` in production |
 | `REDIS_URL` | *(empty)* | Empty disables Redis; in-process fallbacks are then **single-replica only** |
 | `SECRET_ENCRYPTION_KEY` | *(empty)* | **Set this in production.** Empty uses a published dev key and `/ready` reports `secret_encryption: development-key` |
+| `ADMIN_TOKEN` | *(empty)* | Enables `POST /v1/admin/*`. Unset = 503 on those routes |
+| `CLAIM_LEASE_SECONDS` | `60` | Worker lease. Keep above `DELIVERY_TIMEOUT_SECONDS`, or a slow worker has rows stolen mid-flight |
 | `MAX_BODY_BYTES` | `262144` | |
 | `DELIVERY_TIMEOUT_SECONDS` | `10.0` | |
 | `MAX_ATTEMPTS` | `5` | Attempts before DLQ |
@@ -74,9 +76,28 @@ purpose.
 - **Recover** DLQ → `POST /v1/deliveries/{id}/requeue`. Replaying a `success`
   is refused with `409`, since it would duplicate a side effect at the receiver.
 
-## Scaling note
+## Scaling out
 
-Run **one** worker replica. Due deliveries are selected without being claimed,
-so two workers will both fetch and POST the same delivery. Fixing this properly
-needs a claim/lease column or `SELECT ... FOR UPDATE SKIP LOCKED` — see the
-limitations in the README before scaling the worker horizontally.
+**Worker replicas can now run in parallel.** Each claims its batch under a fresh
+token, so no two workers hold the same delivery. Verified with two concurrent
+claimers against PostgreSQL: disjoint sets, no double-claims.
+
+Set `REDIS_URL` before running more than one replica. The delivery claim is
+replica-safe, but the **rate limiter falls back to per-process memory** without
+Redis, which means per-endpoint delivery limits are enforced inconsistently
+across replicas. The honest summary: with N workers and no Redis you get N
+independent rate-limit budgets.
+
+## First deploy with tenants
+
+```bash
+alembic upgrade head          # creates tenants/api_keys, backfills endpoints
+export ADMIN_TOKEN=$(openssl rand -hex 32)
+uvicorn app.main:app
+curl -X POST localhost:8000/v1/admin/tenants \
+  -H "X-Admin-Token: $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"name":"acme"}'
+```
+
+Existing endpoints are assigned to a `legacy` tenant by the migration. Issue a
+key for it, or create tenants as needed.

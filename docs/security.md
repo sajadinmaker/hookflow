@@ -50,14 +50,40 @@ stored value changes.
   future `enc:v2:` row must fail loudly rather than be silently used as a
   signing secret.
 
+## Authentication and tenants
+
+Machine callers present `Authorization: Bearer hf_<prefix>_<secret>`.
+
+- **Only a SHA-256 digest is stored.** The plaintext is returned once, at
+  creation, and is unrecoverable. A fast hash is correct here because the key is
+  256 bits of `secrets.token_hex` output — there is no dictionary to attack, so
+  bcrypt/argon2 would add per-request latency without adding resistance. That
+  trade-off flips immediately if keys are ever user-chosen.
+- **Lookup is by `key_prefix`**, a unique column, so authentication is a single
+  index hit. The digest comparison uses `hmac.compare_digest`.
+- **Unknown prefix and wrong secret return the same error**, so responses do
+  not reveal which prefixes exist.
+- **Every authorised request resolves to one tenant**, applied as a filter on
+  every query. `endpoints.tenant_id` is `NOT NULL` with a foreign key.
+- **Cross-tenant access is `404`, never `403`.** A `403` would confirm that an
+  id exists, which is a leak in itself. Covered by tests using two tenants.
+- **The admin surface fails closed.** With `HOOKFLOW_ADMIN_TOKEN` unset, tenant
+  and key creation return `503`. An unauthenticated route that can mint
+  credentials is a vulnerability, not a bootstrap mechanism.
+
+`Principal.require_tenant()` is a fail-closed backstop for any handler that
+forgets to filter: it raises rather than returning another tenant's row.
+
 ## What does NOT exist (honest gaps)
 
-- **No multi-tenant auth.** Anyone with network access can register endpoints
-  and ingest. Endpoint secrets authenticate *receivers*, not *producers*. Fix:
-  tenants and API keys.
-- **A single worker replica only.** Due deliveries are selected without being
-  claimed, so two workers can both fetch and POST the same delivery. Correctness
-  issue, not a security one, but it is the most important open bug.
+- **API keys cannot expire.** They can be revoked, but there is no TTL or
+  rotation schedule, and a leaked key stays valid until someone notices.
+- **No per-tenant API rate limits.** Ingest is unbounded per tenant; only
+  per-endpoint *delivery* is rate limited.
+- **One shared admin token.** No per-operator identity, roles, or audit trail
+  of who created a tenant.
+- **The rate limiter is per-process when Redis is off**, so it is single-replica
+  only. The delivery claim is replica-safe; the limiter is not.
 - No TLS in Compose: terminate TLS at a reverse proxy / load balancer.
 - Rate limits are per-endpoint delivery fairness, not anti-abuse on ingest.
 - `/metrics` is unauthenticated. Fine on a private network; do not expose it

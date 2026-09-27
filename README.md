@@ -63,6 +63,63 @@ process is how replicas end up racing DDL, and it hides the fact that a
 migration was never written. `alembic check` runs in CI, so a model change
 without a matching migration fails the build.
 
+**Workers claim what they deliver.** Selecting due rows and then updating them
+is not safe with more than one worker: both can read the same free row before
+either writes, and both POST it. Claiming is a single
+`UPDATE ... WHERE id IN (subquery)` that excludes rows already held under a live
+lease — one statement, so the database serialises racers and the loser's
+subquery re-evaluates against the winner's committed rows. PostgreSQL adds
+`FOR UPDATE SKIP LOCKED` so workers do not queue behind each other. Leases
+expire, so a worker that dies mid-delivery cannot strand a row.
+
+**Tenants are a query filter, not a convention.** An API key resolves to
+exactly one tenant and that tenant is applied to every query. Endpoints carry a
+`NOT NULL` foreign key. Cross-tenant access answers `404`, never `403` — a `403`
+would confirm that an id exists, which is itself a leak.
+
+## API
+
+All tenant-scoped routes require `Authorization: Bearer hf_<prefix>_<secret>`.
+
+```bash
+# provision (requires HOOKFLOW_ADMIN_TOKEN; 503 when unset)
+curl -X POST localhost:8000/v1/admin/tenants \
+  -H 'X-Admin-Token: dev' -H 'Content-Type: application/json' \
+  -d '{"name":"acme"}'
+curl -X POST localhost:8000/v1/admin/tenants/$TENANT/keys \
+  -H 'X-Admin-Token: dev' -H 'Content-Type: application/json' -d '{"label":"ci"}'
+
+# use
+curl -X POST localhost:8000/v1/endpoints \
+  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"url":"https://example.com/hook"}'
+```
+
+| Route | Purpose |
+|---|---|
+| `POST /v1/endpoints` | Register a destination (secret returned once) |
+| `GET /v1/endpoints` | List this tenant's endpoints |
+| `POST /v1/events` | Ingest; honours `Idempotency-Key` |
+| `GET /v1/events/{id}` | Event with delivery history |
+| `GET /v1/deliveries` | Filter by `status` / `endpoint_id` |
+| `POST /v1/deliveries/{id}/requeue` | Replay from DLQ (refuses `success` with 409) |
+| `GET /v1/stats` | Queue depth by status |
+| `GET /v1/admin/...` | Tenants and keys (admin token) |
+| `GET /health` `/ready` `/metrics` | Liveness, readiness, Prometheus text |
+
+## Dashboard
+
+`dashboard/` is a Next.js operator UI: queue depth, endpoints, filterable
+deliveries, DLQ with one-click replay, API keys, and metrics.
+
+It reads the API key from the server environment only. Every page is a server
+component and replay is a server action, so the key is never in the browser
+bundle — see `dashboard/README.md`.
+
+```bash
+cd dashboard && cp .env.example .env.local && npm install && npm run dev
+```
+
 ## Correctness testing
 
 The test suite is aimed at the failure modes that are easy to claim and easy to
@@ -76,9 +133,22 @@ leave untested:
 - Transport errors are distinguished from HTTP statuses, and a 4xx/5xx and a
   connection failure follow different paths.
 - Deleting an endpoint mid-flight, DLQ exhaustion, and backoff saturation.
+- **Concurrent claimers receive disjoint rows.** Two threads claim the same
+  batch simultaneously and the test asserts the intersection is empty. Verified
+  against PostgreSQL with `SKIP LOCKED` as well as SQLite.
+- **Tenant isolation**, across two fixtures: a valid key from tenant B cannot
+  list, read, ingest to, or replay tenant A's resources, and gets `404` rather
+  than `403` so ids cannot be probed.
 
-`python -m pytest` — **48 tests**, 91% coverage. The suite runs green on three
-configurations, because the default one hides real bugs:
+Two tests are mutation-verified — they fail when the protection is removed:
+
+| Mutation | Test that catches it |
+|---|---|
+| Drop the idempotency `UNIQUE` from the migration | concurrent-ingest test |
+| `hash_api_key` returns the plaintext | key-storage test |
+
+`python -m pytest` — **79 tests**, 93% coverage on PostgreSQL. The suite runs
+green in three configurations, because the default one hides real bugs:
 
 ```bash
 python -m pytest                                                  # SQLite
@@ -138,21 +208,23 @@ than silent.
 
 Stated plainly, because the interesting ones are the reason for the next steps:
 
-- **A single worker replica only.** `fetch_due_deliveries` selects due rows
-  without claiming them — no `FOR UPDATE SKIP LOCKED`, no lease column. Two
-  workers polling concurrently will both fetch the same delivery and both POST
-  it. This is a real double-delivery bug and is the most important thing to fix
-  before scaling out; the durable fix is a claim/lease column (or
-  `SKIP LOCKED`), not a queue library.
-- **No multi-tenant auth.** Endpoints are unauthenticated; possession of the
-  endpoint id is the only check. No API keys.
-- Rate-limit memory fallback is per-process, so it is single-replica only.
+- **Rate limiting is per-process when Redis is off**, so it is single-replica
+  only. The delivery claim is safe across replicas; the rate limiter is not.
+- **No per-tenant quotas or rate limits on the API itself.** A tenant can
+  ingest without bound; only per-endpoint delivery is limited.
+- **API keys have no expiry.** They can be revoked, but there is no TTL and no
+  rotation schedule.
+- **No tenant self-service.** Tenants and keys are admin-only; there is no
+  signup or billing path.
 - Backoff schedule is fixed at config level, not per endpoint.
 - No TLS in Compose; terminate at a load balancer.
+- **The admin token is a single shared secret.** Fine for one operator, not a
+  model for a multi-operator deployment.
 
 ## Next
 
-1. Multi-worker claim safety (lease column or `SKIP LOCKED`) — correctness.
-2. Tenants and API-key auth — required before this is multi-tenant.
-3. Concurrent-load and worker-throughput benchmarks.
-4. Group commit on the ingest path, which the measurements above point at.
+1. Concurrent-load and worker-throughput benchmarks — the numbers here are
+   sequential per-request latency only.
+2. Group commit on the ingest path, which the measurements point at.
+3. Per-tenant API rate limits and quota enforcement.
+4. Key expiry and rotation.
