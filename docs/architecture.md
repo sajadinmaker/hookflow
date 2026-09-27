@@ -22,3 +22,8 @@ Key decisions:
 4. HMAC-SHA256 per-endpoint secret; verification docs in README.
 5. Fixed-window per-endpoint rate limits; Redis when configured, memory fallback single-replica only.
 6. Observability without new deps: `X-Request-ID` middleware, Prometheus-text `/metrics`, `/v1/stats` for queue-depth alerts; worker poll indexed on `(status, next_attempt_at)`.
+7. Schema owned by Alembic, applied as a deploy step — never `create_all` at boot, so replicas cannot race DDL and a missing migration cannot hide.
+8. Webhook secrets encrypted at rest (Fernet envelope) behind a `KeyProvider` seam, plaintext present only while signing. Encryption rather than hashing is forced by the fact that the server must reproduce the secret to sign; see `docs/security.md`.
+
+Known boundary: the worker does not claim the rows it selects, so exactly one
+worker replica is correct today. See the README limitations.
