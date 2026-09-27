@@ -31,9 +31,16 @@ def test_duplicate_key_rejected_by_constraint(client):
 
     ep = client.post("/v1/endpoints", json={"url": "https://example.com/wh"}).json()
 
+    from app.db import Tenant, new_id
+
     session = SessionLocal()
     try:
-        endpoint = Endpoint(url="https://example.com/wh", secret="x")
+        tenant = Tenant(id=new_id(), name="constraint-fixture")
+        session.add(tenant)
+        session.flush()
+        endpoint = Endpoint(
+            tenant_id=tenant.id, url="https://example.com/wh", secret="x"
+        )
         session.add(endpoint)
         session.commit()
 
@@ -188,7 +195,17 @@ def test_unreachable_endpoint_retries_then_dlqs(client):
     upgrade_to_head(url)
     session = make_session_factory(engine)()
 
-    ep = Endpoint(url="https://example.invalid/wh", secret="s", rate_limit_per_minute=60)
+    from app.db import Tenant, new_id
+
+    tenant = Tenant(id=new_id(), name="unreachable-fixture")
+    session.add(tenant)
+    session.flush()
+    ep = Endpoint(
+        tenant_id=tenant.id,
+        url="https://example.invalid/wh",
+        secret="s",
+        rate_limit_per_minute=60,
+    )
     session.add(ep)
     session.flush()
     ev = Event(endpoint_id=ep.id, payload='{"a":1}')

@@ -23,7 +23,14 @@ def _session():
 
 
 def _seed(session, url="https://example.com/wh"):
-    ep = Endpoint(url=url, secret="s", rate_limit_per_minute=60)
+    from app.db import Tenant, new_id
+
+    tenant = Tenant(id=new_id(), name="worker-fixture")
+    session.add(tenant)
+    session.flush()
+    ep = Endpoint(
+        tenant_id=tenant.id, url=url, secret="s", rate_limit_per_minute=60
+    )
     session.add(ep)
     session.flush()
     ev = Event(endpoint_id=ep.id, payload='{"a":1}')

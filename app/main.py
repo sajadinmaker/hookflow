@@ -12,7 +12,9 @@ from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 
-from .config import Settings, get_settings
+from .admin import build_admin_router
+from .auth import Principal, build_principal_dependency
+from .config import Settings, get_settings, set_settings
 from .crypto import get_secret_box
 from .db import Delivery, Endpoint, Event, make_engine, utcnow
 from .queue import DeliveryQueue
@@ -54,6 +56,11 @@ def get_settings_dep() -> Settings:
 def init_state(settings: Settings | None = None) -> None:
     global engine, SessionLocal, rate_limiter, delivery_queue
     settings = settings or get_settings()
+    # Pin these settings process-wide. Handlers and the admin routes resolve
+    # configuration through get_settings(), so without this an explicitly
+    # supplied Settings would steer only the engine and leave the rest of the
+    # app reading the environment.
+    set_settings(settings)
     # One engine factory for every environment, so SQLite dev/test and
     # PostgreSQL production cannot drift in behaviour.
     engine = make_engine(settings.database_url)
@@ -90,7 +97,9 @@ def to_delivery_out(d: Delivery) -> DeliveryOut:
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     init_state(settings or get_settings())
-    app = FastAPI(title="HookFlow", version="0.1.0")
+    app = FastAPI(title="HookFlow", version="0.2.0")
+    require_principal = build_principal_dependency(get_db)
+    app.include_router(build_admin_router(get_db))
 
     @app.middleware("http")
     async def request_id_middleware(request: Request, call_next):
@@ -135,10 +144,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return Response(content="\n".join(lines) + "\n", media_type="text/plain")
 
     @app.get("/v1/stats")
-    def stats(db: Session = Depends(get_db)):
+    def stats(
+        db: Session = Depends(get_db),
+        principal: Principal = Depends(require_principal),
+    ):
         """Queue-depth + delivery-state overview for dashboards/alerts."""
         rows = (
             db.query(Delivery.status, func.count(Delivery.id))
+            .join(Endpoint, Delivery.endpoint_id == Endpoint.id)
+            .filter(Endpoint.tenant_id == principal.tenant_id)
             .group_by(Delivery.status)
             .all()
         )
@@ -183,7 +197,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/v1/endpoints", status_code=201, response_model=EndpointCreated)
     def register_endpoint(
-        payload: EndpointCreate, db: Session = Depends(get_db)
+        payload: EndpointCreate,
+        db: Session = Depends(get_db),
+        principal: Principal = Depends(require_principal),
     ):
         settings = get_settings()
         body_len = len(payload.url.encode())
@@ -193,6 +209,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # returned to the caller exactly once, in this response.
         plaintext_secret = payload.secret or generate_secret()
         endpoint = Endpoint(
+            tenant_id=principal.tenant_id,
             url=payload.url,
             secret=get_secret_box(settings.secret_encryption_key).encrypt(plaintext_secret),
             rate_limit_per_minute=payload.rate_limit_per_minute,
@@ -213,9 +230,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         limit: int = Query(default=50, ge=1, le=200),
         offset: int = Query(default=0, ge=0),
         db: Session = Depends(get_db),
+        principal: Principal = Depends(require_principal),
     ):
         rows = (
-            db.query(Endpoint).order_by(Endpoint.created_at).offset(offset).limit(limit).all()
+            db.query(Endpoint)
+            .filter(Endpoint.tenant_id == principal.tenant_id)
+            .order_by(Endpoint.created_at)
+            .offset(offset)
+            .limit(limit)
+            .all()
         )
         return {
             "items": [
@@ -233,12 +256,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def ingest_event(
         payload: EventCreate,
         db: Session = Depends(get_db),
+        principal: Principal = Depends(require_principal),
         idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     ):
         settings = get_settings()
         key = payload.idempotency_key or idempotency_key
         endpoint = db.get(Endpoint, payload.endpoint_id)
-        if endpoint is None:
+        # 404 rather than 403: another tenant's endpoint must be indistinguishable
+        # from one that does not exist.
+        if endpoint is None or endpoint.tenant_id != principal.tenant_id:
             raise HTTPException(status_code=404, detail="endpoint not found")
         try:
             raw = json.dumps(payload.payload, separators=(",", ":"))
@@ -318,10 +344,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
 
     @app.get("/v1/events/{event_id}")
-    def get_event(event_id: str, db: Session = Depends(get_db)):
+    def get_event(
+        event_id: str,
+        db: Session = Depends(get_db),
+        principal: Principal = Depends(require_principal),
+    ):
         event = db.get(Event, event_id)
         if event is None:
             raise HTTPException(status_code=404, detail="event not found")
+        principal.require_tenant(
+            db.get(Endpoint, event.endpoint_id).tenant_id
+        )
         deliveries = (
             db.query(Delivery).filter(Delivery.event_id == event.id).order_by(
                 Delivery.created_at
@@ -342,8 +375,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         limit: int = Query(default=50, ge=1, le=200),
         offset: int = Query(default=0, ge=0),
         db: Session = Depends(get_db),
+        principal: Principal = Depends(require_principal),
     ):
-        q = db.query(Delivery)
+        # Scope to the caller's endpoints via a join; a delivery id from another
+        # tenant is therefore unreachable, not merely filtered from the listing.
+        q = db.query(Delivery).join(
+            Endpoint, Delivery.endpoint_id == Endpoint.id
+        ).filter(Endpoint.tenant_id == principal.tenant_id)
         if status:
             if status not in ("queued", "success", "retrying", "dlq"):
                 raise HTTPException(status_code=422, detail="invalid status")
@@ -354,7 +392,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {"items": [to_delivery_out(d).model_dump() for d in rows]}
 
     @app.post("/v1/deliveries/{delivery_id}/requeue", response_model=DeliveryOut)
-    def requeue_delivery(delivery_id: str, db: Session = Depends(get_db)):
+    def requeue_delivery(
+        delivery_id: str,
+        db: Session = Depends(get_db),
+        principal: Principal = Depends(require_principal),
+    ):
         """Replay a dead-letter (or retrying/queued) delivery.
 
         Resets attempts so the worker treats it as fresh. Only DLQ +
@@ -363,6 +405,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         """
         delivery = db.get(Delivery, delivery_id)
         if delivery is None:
+            raise HTTPException(status_code=404, detail="delivery not found")
+        endpoint = db.get(Endpoint, delivery.endpoint_id)
+        if endpoint is None or endpoint.tenant_id != principal.tenant_id:
             raise HTTPException(status_code=404, detail="delivery not found")
         if delivery.status not in ("dlq", "retrying", "queued"):
             raise HTTPException(

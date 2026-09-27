@@ -21,10 +21,76 @@ def new_id() -> str:
     return uuid.uuid4().hex
 
 
-class Endpoint(Base):
-    __tablename__ = "endpoints"
+class Tenant(Base):
+    """An isolated owner of endpoints, events and deliveries.
+
+    Every tenant-scoped query filters on tenant_id. There is no "global" read
+    path: an API key resolves to exactly one tenant, and that tenant is applied
+    to every query it authorises.
+    """
+
+    __tablename__ = "tenants"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    name: Mapped[str] = mapped_column(String(200), nullable=False, unique=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow
+    )
+
+    endpoints: Mapped[list["Endpoint"]] = relationship(
+        back_populates="tenant", cascade="all, delete-orphan"
+    )
+    api_keys: Mapped[list["ApiKey"]] = relationship(
+        back_populates="tenant", cascade="all, delete-orphan"
+    )
+
+
+class ApiKey(Base):
+    """A machine credential for one tenant.
+
+    Only a SHA-256 digest of the key is stored. The plaintext is returned once at
+    creation and is unrecoverable afterwards.
+
+    A fast hash is correct here, unlike for a user password: the key is 256 bits
+    of CSPRNG output, so there is no dictionary to attack and no need for a
+    slow KDF. `key_prefix` narrows the lookup to one row, and the digest
+    comparison is constant-time.
+    """
+
+    __tablename__ = "api_keys"
+    __table_args__ = (
+        UniqueConstraint("key_prefix", name="uq_api_keys_prefix"),
+        Index("ix_api_keys_tenant", "tenant_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    tenant_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    key_prefix: Mapped[str] = mapped_column(String(16), nullable=False)
+    key_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    label: Mapped[str] = mapped_column(String(200), nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow
+    )
+    last_used_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    revoked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    tenant: Mapped[Tenant] = relationship(back_populates="api_keys")
+
+
+class Endpoint(Base):
+    __tablename__ = "endpoints"
+    __table_args__ = (Index("ix_endpoints_tenant", "tenant_id"),)
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    tenant_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
     url: Mapped[str] = mapped_column(Text, nullable=False)
     # Encrypted at rest (see app/crypto.py), so this holds a Fernet envelope,
     # not the 64-char hex secret. That is ~147 characters for a generated
@@ -37,6 +103,7 @@ class Endpoint(Base):
         DateTime(timezone=True), nullable=False, default=utcnow
     )
 
+    tenant: Mapped[Tenant] = relationship(back_populates="endpoints")
     deliveries: Mapped[list["Delivery"]] = relationship(
         back_populates="endpoint", cascade="all, delete-orphan"
     )
@@ -74,11 +141,13 @@ class Event(Base):
 class Delivery(Base):
     __tablename__ = "deliveries"
     __table_args__ = (
-        # Hot path for the worker: "what is due now?" Must be indexed or
+        # Hot path for the worker: "what is due now?". Must be indexed or
         # every poll is a full-table scan.
         Index("ix_deliveries_status_next", "status", "next_attempt_at"),
         Index("ix_deliveries_endpoint_created", "endpoint_id", "created_at"),
         Index("ix_deliveries_event", "event_id"),
+        # Supports the "unclaimed OR lease expired" half of the claim predicate.
+        Index("ix_deliveries_claim", "claim_token", "claimed_at"),
     )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
@@ -97,6 +166,14 @@ class Delivery(Base):
     last_status_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Worker lease. A worker claims a due row by writing a batch-unique token;
+    # only the holder may deliver it. A crashed worker's rows become claimable
+    # again once claimed_at passes claim_lease_seconds. Without this, two
+    # workers polling concurrently both select the same row and both POST it.
+    claim_token: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    claimed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utcnow
     )

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -101,55 +102,154 @@ def fetch_due_deliveries(session, limit: int = 20) -> list[Delivery]:
     )
 
 
+def claim_due_deliveries(
+    session,
+    token: str,
+    limit: int = 20,
+    lease_seconds: float = 60.0,
+) -> list[Delivery]:
+    """Atomically take ownership of up to `limit` due deliveries.
+
+    Safety comes from the fact that this is a single UPDATE whose subquery
+    excludes rows that are already claimed with a live lease. The database
+    serialises the two racing workers, and the loser's subquery is re-evaluated
+    against the winner's committed rows, so it simply finds fewer candidates.
+
+    A plain SELECT-then-UPDATE would not be safe: both workers could read the
+    same free row before either wrote. On PostgreSQL the subquery additionally
+    uses FOR UPDATE SKIP LOCKED so N workers do not queue behind each other;
+    SQLite has no row locks, but serialises writers anyway.
+    """
+    now = utcnow()
+    stale_before = now - timedelta(seconds=lease_seconds)
+
+    due = (
+        session.query(Delivery.id)
+        .filter(Delivery.status.in_(["queued", "retrying"]))
+        .filter((Delivery.next_attempt_at.is_(None)) | (Delivery.next_attempt_at <= now))
+        .filter(
+            (Delivery.claim_token.is_(None)) | (Delivery.claimed_at < stale_before)
+        )
+        .order_by(Delivery.created_at)
+        .limit(limit)
+    )
+    if session.bind is not None and session.bind.dialect.name == "postgresql":
+        due = due.with_for_update(skip_locked=True)
+
+    session.query(Delivery).filter(Delivery.id.in_(due)).update(
+        {Delivery.claim_token: token, Delivery.claimed_at: now},
+        synchronize_session=False,
+    )
+    session.commit()
+
+    return (
+        session.query(Delivery)
+        .filter(Delivery.claim_token == token)
+        .order_by(Delivery.created_at)
+        .all()
+    )
+
+
+def release_claim(session, delivery: Delivery) -> None:
+    """Drop the lease so the row is immediately claimable again."""
+    delivery.claim_token = None
+    delivery.claimed_at = None
+    session.add(delivery)
+
+
+def release_expired_claims(session, lease_seconds: float = 60.0) -> int:
+    """Free rows held by a worker that died mid-delivery. Returns rows freed."""
+    stale_before = utcnow() - timedelta(seconds=lease_seconds)
+    freed = (
+        session.query(Delivery)
+        .filter(Delivery.claim_token.isnot(None))
+        .filter(Delivery.claimed_at < stale_before)
+        .update(
+            {Delivery.claim_token: None, Delivery.claimed_at: None},
+            synchronize_session=False,
+        )
+    )
+    session.commit()
+    return freed
+
+
 def process_due_deliveries(
     session,
     settings: Settings,
     rate_limiter: RateLimiter,
     client: httpx.Client | None = None,
     limit: int = 20,
+    claim_token: str | None = None,
 ) -> dict[str, int]:
-    """One worker pass. Returns counts by outcome. Rate-limited endpoints are skipped."""
+    """One worker pass. Returns counts by outcome. Rate-limited endpoints are skipped.
+
+    Pass `claim_token` to claim the batch exclusively. Omit it for the
+    single-worker case, where claiming would be pure overhead.
+    """
     stats = {"success": 0, "retrying": 0, "dlq": 0, "rate_limited": 0}
-    for delivery in fetch_due_deliveries(session, limit):
+    token = claim_token or uuid.uuid4().hex
+    exclusive = claim_token is not None
+    lease_seconds = settings.claim_lease_seconds
+
+    if exclusive:
+        release_expired_claims(session, lease_seconds)
+        batch = claim_due_deliveries(session, token, limit, lease_seconds)
+    else:
+        batch = fetch_due_deliveries(session, limit)
+
+    for delivery in batch:
         endpoint = session.get(Endpoint, delivery.endpoint_id)
         if endpoint is None:
             delivery.status = "dlq"
             delivery.last_error = "endpoint deleted"
+            if exclusive:
+                release_claim(session, delivery)
             session.add(delivery)
             session.commit()
             stats["dlq"] += 1
             continue
         if not rate_limiter.allow(endpoint.id, endpoint.rate_limit_per_minute):
+            # Leave the claim in place: the row is rate-limited, not finished,
+            # and the next pass should pick it up.
+            if exclusive:
+                release_claim(session, delivery)
+                session.commit()
             stats["rate_limited"] += 1
             continue
         event_body = delivery.event.payload.encode() if delivery.event else b"{}"
+        if exclusive:
+            release_claim(session, delivery)
         settled = settle_delivery(session, settings, delivery, endpoint, event_body, client)
         stats[settled.status if settled.status in stats else "retrying"] += 1
     return stats
 
 
 def run_worker_forever(session_factory, settings: Settings, poll_seconds: float = 2.0) -> None:
-    """Long-running worker loop (used by `python -m app.worker`)."""
+    """Long-running worker loop (used by `python -m app.worker`).
+
+    Claims each batch under a fresh token, so running several of these against
+    one database is safe: no two workers hold the same delivery at once.
+    """
     import time as _time
 
     rate_limiter = RateLimiter(settings.redis_url)
     queue = DeliveryQueue(settings.redis_url)
     while True:
-        queued_id = queue.dequeue(timeout=1)
         session = session_factory()
         try:
-            if queued_id:
-                delivery = session.get(Delivery, queued_id)
-                if delivery is not None and delivery.status in ("queued", "retrying"):
-                    endpoint = session.get(Endpoint, delivery.endpoint_id)
-                    if endpoint and rate_limiter.allow(
-                        endpoint.id, endpoint.rate_limit_per_minute
-                    ):
-                        body = delivery.event.payload.encode() if delivery.event else b"{}"
-                        settle_delivery(session, settings, delivery, endpoint, body)
-            process_due_deliveries(session, settings, rate_limiter)
+            process_due_deliveries(
+                session,
+                settings,
+                rate_limiter,
+                claim_token=uuid.uuid4().hex,
+            )
         finally:
             session.close()
+        # Redis only shortens the wait: drain any wake-ups, then sleep.
+        while True:
+            queued_id = queue.dequeue(timeout=0)
+            if not queued_id:
+                break
         _time.sleep(poll_seconds)
 
 
