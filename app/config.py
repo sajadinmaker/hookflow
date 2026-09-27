@@ -20,6 +20,11 @@ class Settings(BaseSettings):
     # Exponential backoff delays (seconds) per failed attempt index.
     backoff_schedule_seconds: list[int] = [60, 300, 1800, 7200, 43200]
     default_rate_limit_per_minute: int = 60
+    # Symmetric key protecting webhook secrets at rest. Accepts a Fernet key or
+    # any passphrase (SHA-256 stretched). Leave empty in local dev and a
+    # well-known development key is used — /ready reports that state so it cannot
+    # pass unnoticed in production.
+    secret_encryption_key: str = ""
 
 
 @lru_cache

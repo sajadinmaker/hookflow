@@ -1,16 +1,24 @@
 """Worker: success, retry-then-DLQ, rate-limit skip."""
 
+import tempfile
+from pathlib import Path
+
 import httpx
 
 from app.config import Settings
-from app.db import Delivery, Endpoint, Event, init_db, make_engine, make_session_factory
+from app.db import Delivery, Endpoint, Event, make_engine, make_session_factory
+from app.migrations import upgrade_to_head
 from app.ratelimit import RateLimiter
 from app.worker import process_due_deliveries
 
 
 def _session():
-    engine = make_engine("sqlite://")
-    init_db(engine)
+    # A file-backed SQLite DB, not ":memory:": Alembic opens its own engine, and
+    # an in-memory database would be empty again by the time the test connects.
+    db_file = Path(tempfile.mkdtemp()) / "worker.db"
+    url = f"sqlite:///{db_file}"
+    engine = make_engine(url)
+    upgrade_to_head(url)
     return make_session_factory(engine)()
 
 

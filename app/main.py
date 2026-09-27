@@ -8,17 +8,19 @@ import time
 import uuid
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
-from sqlalchemy import create_engine, func
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 
 from .config import Settings, get_settings
-from .db import Delivery, Endpoint, Event, init_db, utcnow
+from .crypto import get_secret_box
+from .db import Delivery, Endpoint, Event, make_engine, utcnow
 from .queue import DeliveryQueue
 from .ratelimit import RateLimiter
 from .schemas import (
     DeliveryOut,
     EndpointCreate,
+    EndpointCreated,
     EndpointOut,
     EventCreate,
     EventOut,
@@ -52,16 +54,12 @@ def get_settings_dep() -> Settings:
 def init_state(settings: Settings | None = None) -> None:
     global engine, SessionLocal, rate_limiter, delivery_queue
     settings = settings or get_settings()
-    global_kwargs: dict = {}
-    if settings.database_url.startswith("sqlite"):
-        global_kwargs = {"connect_args": {"check_same_thread": False}}
-        engine = create_engine(settings.database_url, **global_kwargs)
-    else:
-        from .db import make_engine
-
-        engine = make_engine(settings.database_url)
+    # One engine factory for every environment, so SQLite dev/test and
+    # PostgreSQL production cannot drift in behaviour.
+    engine = make_engine(settings.database_url)
     SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
-    init_db(engine)
+    # NOTE: schema is NOT created here. Run `alembic upgrade head` as a deploy
+    # step. See app/migrations.py and docs/deployment.md.
     # Rebind helpers to current settings (tests override redis_url="").
     rate_limiter = RateLimiter(settings.redis_url)
     delivery_queue = DeliveryQueue(settings.redis_url)
@@ -154,9 +152,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/ready")
     def ready(db: Session = Depends(get_db)):
-        # DB check.
-        db.query(Endpoint.id).limit(1).all()
-        checks: dict = {"database": "ok"}
+        checks: dict = {}
+        try:
+            db.query(Endpoint.id).limit(1).all()
+            checks["database"] = "ok"
+        except OperationalError as exc:
+            # Almost always "relation does not exist", i.e. migrations were
+            # never applied. Say so plainly rather than returning a bare 500.
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "database schema is not present or unreachable; "
+                    "run `alembic upgrade head` before starting the app"
+                ),
+            ) from exc
         # Redis check (optional dependency).
         if delivery_queue.has_redis:
             try:
@@ -166,9 +175,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise HTTPException(status_code=503, detail=f"redis unreachable: {exc}")
         else:
             checks["redis"] = "not-configured"
+        # Secret encryption posture. A development key is a deploy mistake, not a
+        # detail: the readiness probe is what an operator actually watches.
+        box = get_secret_box(get_settings().secret_encryption_key)
+        checks["secret_encryption"] = "development-key" if box.using_development_key else "ok"
         return {"status": "ok", **checks}
 
-    @app.post("/v1/endpoints", status_code=201, response_model=EndpointOut)
+    @app.post("/v1/endpoints", status_code=201, response_model=EndpointCreated)
     def register_endpoint(
         payload: EndpointCreate, db: Session = Depends(get_db)
     ):
@@ -176,19 +189,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         body_len = len(payload.url.encode())
         if body_len > 2000:
             raise HTTPException(status_code=413, detail="url too long")
+        # The secret is encrypted before it ever reaches the database and is
+        # returned to the caller exactly once, in this response.
+        plaintext_secret = payload.secret or generate_secret()
         endpoint = Endpoint(
             url=payload.url,
-            secret=payload.secret or generate_secret(),
+            secret=get_secret_box(settings.secret_encryption_key).encrypt(plaintext_secret),
             rate_limit_per_minute=payload.rate_limit_per_minute,
         )
         db.add(endpoint)
         db.commit()
         db.refresh(endpoint)
-        return EndpointOut(
+        return EndpointCreated(
             id=endpoint.id,
             url=endpoint.url,
             rate_limit_per_minute=endpoint.rate_limit_per_minute,
             created_at=endpoint.created_at.isoformat(),
+            secret=plaintext_secret,
         )
 
     @app.get("/v1/endpoints")

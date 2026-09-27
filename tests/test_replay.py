@@ -20,8 +20,6 @@ def _fail_client(status=500):
 
 def test_requeue_dlq_resets_to_queued(client):
     from app import main as main_module
-    from app.config import Settings
-    from app.db import Endpoint, Event, init_db, make_engine, make_session_factory
     from app.worker import process_due_deliveries
     from app.ratelimit import RateLimiter
 
@@ -91,23 +89,38 @@ def test_request_id_header(client):
     assert r2.headers["X-Request-ID"] == "trace-123"
 
 
-def test_idempotency_unique_constraint_enforced_at_db():
-    """The UNIQUE(endpoint_id, idempotency_key) must exist, not just app logic."""
+def test_idempotency_unique_constraint_enforced_at_db(client):
+    """The UNIQUE(endpoint_id, idempotency_key) must exist in the real database.
+
+    Asserting against Base.metadata only proves the model declares it. This
+    inspects the migrated schema, so a migration that forgot the constraint
+    (or a model that drifted from the migration) fails here.
+    """
     from sqlalchemy import inspect
 
-    from app.db import Base
+    from app.main import engine
 
-    table = Base.metadata.tables["events"]
-    unique_cols = set()
-    for c in table.constraints:
-        if c.__class__.__name__ == "UniqueConstraint" and set(
-            col.name for col in c.columns
-        ) == {"endpoint_id", "idempotency_key"}:
-            unique_cols = {"endpoint_id", "idempotency_key"}
-    assert unique_cols == {"endpoint_id", "idempotency_key"}, (
-        "missing UNIQUE(endpoint_id, idempotency_key) — race window is open"
+    insp = inspect(engine)
+
+    uniques = insp.get_unique_constraints("events")
+    assert any(
+        set(u["column_names"]) == {"endpoint_id", "idempotency_key"} for u in uniques
+    ), f"missing UNIQUE(endpoint_id, idempotency_key) in the database — {uniques}"
+
+    indexes = insp.get_indexes("deliveries")
+    assert any(
+        tuple(i["column_names"]) == ("status", "next_attempt_at") for i in indexes
+    ), f"worker poll index missing from the database — {indexes}"
+
+
+def test_migrations_and_models_agree(client):
+    """No model change may ship without a matching migration (CI gate, run per-test)."""
+    from app.main import engine as _engine
+    from app.migrations import check_for_drift
+
+    # Pass the URL object, not str(url): SQLAlchemy renders the password as
+    # "***" in the string form, and the check opens its own connection.
+    assert check_for_drift(_engine.url), (
+        "model definitions and Alembic migrations have diverged — "
+        "run `alembic revision --autogenerate`"
     )
-
-    deliveries = Base.metadata.tables["deliveries"]
-    index_cols = {tuple(i.columns.keys()) for i in deliveries.indexes}
-    assert ("status", "next_attempt_at") in index_cols, "worker poll index missing"

@@ -5,3 +5,8 @@ venv/
 .env
 *.db
 .pytest_cache/
+coverage.xml
+.coverage
+htmlcov/
+*.egg-info/
+uv.lock

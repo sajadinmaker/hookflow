@@ -7,6 +7,74 @@ on:
     branches: [main]
 
 jobs:
+  schema:
+    # Models and migrations must not drift. A model change shipped without a
+    # matching migration passes every functional test and then fails in
+    # production, so this is a separate, fast gate.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Migrations apply cleanly from empty
+        run: |
+          DATABASE_URL=sqlite:///./ci.db alembic upgrade head
+      - name: No model/migration drift
+        run: |
+          DATABASE_URL=sqlite:///./ci.db alembic check
+      - name: Migrations reverse cleanly
+        run: |
+          DATABASE_URL=sqlite:///./ci.db alembic downgrade base
+          DATABASE_URL=sqlite:///./ci.db alembic upgrade head
+
+  postgres:
+    # The suite normally runs on SQLite. Run it against the production engines
+    # too: dialect differences (VARCHAR length enforcement, constraint
+    # enforcement, locking, DateTime handling) are exactly what SQLite hides.
+    # The first PostgreSQL run caught a real defect — an encrypted secret
+    # exceeding VARCHAR(128) that SQLite accepted without complaint.
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_DB: hookflow
+          POSTGRES_USER: hookflow
+          POSTGRES_PASSWORD: hookflow
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -r requirements.txt -r requirements-dev.txt
+      - name: Migrate
+        env:
+          DATABASE_URL: postgresql+psycopg://hookflow:hookflow@localhost:5432/hookflow
+        run: alembic upgrade head
+      - name: Tests on PostgreSQL + Redis
+        env:
+          HOOKFLOW_TEST_DATABASE_URL: postgresql+psycopg://hookflow:hookflow@localhost:5432/hookflow
+          REDIS_URL: redis://localhost:6379/0
+        run: python -m pytest -q --cov=app --cov-report=term-missing --cov-fail-under=85
+
   tests:
     runs-on: ubuntu-latest
     steps:
@@ -17,7 +85,10 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt -r requirements-dev.txt
       - name: Run tests
-        run: python -m pytest -q
+        run: python -m pytest
+      - name: Enforce coverage floor
+        run: |
+          python -m coverage report --fail-under=85
 
   docker-build:
     runs-on: ubuntu-latest

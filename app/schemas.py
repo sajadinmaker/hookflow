@@ -27,6 +27,17 @@ class EndpointOut(BaseModel):
     created_at: str
 
 
+class EndpointCreated(EndpointOut):
+    """Creation response only.
+
+    Carries the plaintext secret exactly once, because the receiver needs it to
+    verify HMAC signatures. It is never returned again — at rest the value is
+    encrypted, and there is deliberately no endpoint that will hand it back.
+    """
+
+    secret: str
+
+
 class EventCreate(BaseModel):
     endpoint_id: str = Field(min_length=1, max_length=64)
     payload: dict[str, Any]

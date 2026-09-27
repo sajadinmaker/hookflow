@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 import httpx
 
 from .config import Settings
+from .crypto import get_secret_box
 from .db import Delivery, Endpoint, utcnow
 from .queue import DeliveryQueue
 from .ratelimit import RateLimiter
@@ -63,8 +64,11 @@ def settle_delivery(
     client: httpx.Client | None = None,
 ) -> Delivery:
     delivery.attempts += 1
+    # The stored secret is ciphertext. It is decrypted here, at the only moment
+    # the plaintext is genuinely required, and never written back or logged.
+    plaintext_secret = get_secret_box(settings.secret_encryption_key).decrypt(endpoint.secret)
     status_code, error, latency_ms = deliver_once(
-        body, endpoint.url, endpoint.secret, settings.delivery_timeout_seconds, client
+        body, endpoint.url, plaintext_secret, settings.delivery_timeout_seconds, client
     )
     delivery.last_status_code = status_code
     delivery.last_error = error
@@ -151,9 +155,8 @@ def run_worker_forever(session_factory, settings: Settings, poll_seconds: float 
 
 if __name__ == "__main__":  # pragma: no cover
     from .config import get_settings
-    from .db import init_db, make_engine, make_session_factory
+    from .db import make_engine, make_session_factory
 
     _settings = get_settings()
     _engine = make_engine(_settings.database_url)
-    init_db(_engine)
     run_worker_forever(make_session_factory(_engine), _settings)
