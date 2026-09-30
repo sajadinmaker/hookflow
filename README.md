@@ -228,3 +228,9 @@ Stated plainly, because the interesting ones are the reason for the next steps:
 2. Group commit on the ingest path, which the measurements point at.
 3. Per-tenant API rate limits and quota enforcement.
 4. Key expiry and rotation.
+
+---
+
+## Maintenance
+
+Last maintained: 2026-09-30 – minor docs touch.
