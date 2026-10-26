@@ -1,5 +1,7 @@
 # HookFlow
 
+[![ci](https://github.com/sajadinmaker/hookflow/actions/workflows/ci.yml/badge.svg)](https://github.com/sajadinmaker/hookflow/actions/workflows/ci.yml)
+
 Reliable webhook and event delivery infrastructure.
 
 Accept an event durably, then deliver it with retries, signatures, and a
@@ -164,6 +166,23 @@ Redis for exactly this reason. `app/db.py` likewise enables
 `PRAGMA foreign_keys` on SQLite, which is off by default — otherwise local runs
 silently accept rows PostgreSQL would reject.
 
+## Load benchmarking
+
+`scripts/load_test.py` provisions an admin tenant, mints an API key, and runs
+the full authed ingest path in-process, printing percentile latencies:
+
+```bash
+python scripts/load_test.py --events 300 --payload-kb 1
+```
+
+```text
+ingest: 300 events, 1KB payload | 362.6 rps | p50 2.7ms p95 3.15ms p99 3.41ms
+mean 2.76ms total 0.827s (sqlite, redis=off, TestClient in-process, single worker)
+```
+
+Measured against a throwaway SQLite database by default; point
+`--database-url`/`--redis-url` at production engines for comparable numbers.
+
 ## Measured performance
 
 Numbers are measured, not estimated. Reproduce with `scripts/load_test.py`;
@@ -233,4 +252,4 @@ Stated plainly, because the interesting ones are the reason for the next steps:
 
 ## Maintenance
 
-Last maintained: 2026-09-30 – minor docs touch.
+Last maintained: 2026-10-26 – load-test section added (harness now runs the authed ingest path); CI green in all jobs.
