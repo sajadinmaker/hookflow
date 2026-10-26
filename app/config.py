@@ -43,6 +43,15 @@ def _from_environment() -> Settings:
     return Settings()
 
 
+def reset_settings_cache() -> None:
+    """Forget the settings read from the environment.
+
+    Complements `reset_secret_box_cache`: after an env var changes, construct
+    resolution starts fresh instead of returning a stale process-wide instance.
+    """
+    _from_environment.cache_clear()
+
+
 _settings_override: Settings | None = None
 
 

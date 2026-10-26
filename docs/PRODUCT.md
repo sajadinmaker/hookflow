@@ -1,7 +1,7 @@
 # HookFlow — Product Documentation
 
 > User-serving product guide (technical deep docs already in `docs/`).
-> Codebase: `/home/sajad/Projects/portfolio/hookflow` | Stack: FastAPI + PostgreSQL + Redis + Next.js dashboard | Tests: 79, 93% cov
+> Codebase: `/home/sajad/hookflow` | Stack: FastAPI + PostgreSQL + Redis + Next.js dashboard | Tests: 79, 93% cov
 
 ## 1. What this product is
 

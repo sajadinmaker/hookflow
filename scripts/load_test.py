@@ -30,8 +30,11 @@ import statistics
 import sys
 import tempfile
 import time
+import uuid
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+
+ADMIN_TOKEN_VALUE = "load-test-admin-token"
 
 
 def _percentile(sorted_values: list[float], fraction: float) -> float:
@@ -56,31 +59,55 @@ def run(events: int, payload_kb: int, database_url: str, redis_url: str) -> dict
     from fastapi.testclient import TestClient
 
     from app import main as main_module
-    from app.config import Settings, get_settings
+    from app.config import Settings, reset_settings_cache
     from app.crypto import reset_secret_box_cache
     from app.migrations import upgrade_to_head
 
     upgrade_to_head(database_url)
-    get_settings.cache_clear()
+    os.environ["ADMIN_TOKEN"] = ADMIN_TOKEN_VALUE
+    reset_settings_cache()
     reset_secret_box_cache()
-    settings = Settings(database_url=database_url, redis_url=redis_url)
+    settings = Settings(
+        database_url=database_url, redis_url=redis_url, admin_token=ADMIN_TOKEN_VALUE
+    )
     main_module.init_state(settings)
     app = main_module.create_app(settings)
 
     payload = {"data": "x" * (payload_kb * 1024)}
     latencies: list[float] = []
+    admin = {"X-Admin-Token": ADMIN_TOKEN_VALUE}
 
     with TestClient(app) as client:
+        # Tenant-scoped routes take Bearer keys, including the ingest benchmarked
+        # below, so the benchmark provisions one through the admin path.
+        admin_details = admin.copy()
+        admin_details["Content-Type"] = "application/json"
+        tenant_name = f"load-test-{uuid.uuid4().hex[:8]}"
+        tenant = client.post(
+            "/v1/admin/tenants",
+            headers=admin_details,
+            json={"name": tenant_name},
+        )
+        assert tenant.status_code == 201, tenant.text
+        minted = client.post(
+            f"/v1/admin/tenants/{tenant.json()['id']}/keys",
+            headers=admin_details,
+            json={"label": "load-test"},
+        )
+        assert minted.status_code == 201, minted.text
+        auth = {"Authorization": f"Bearer {minted.json()['api_key']}"}
+
         created = client.post(
             "/v1/endpoints",
             json={"url": "https://example.com/wh", "rate_limit_per_minute": 10000},
+            headers=auth,
         )
         assert created.status_code == 201, f"endpoint setup failed: {created.status_code} {created.text}"
         endpoint_id = created.json()["id"]
 
         # Warm the connection pool and the endpoint row so the first sample is
         # not paying one-off costs.
-        client.post("/v1/events", json={"endpoint_id": endpoint_id, "payload": payload})
+        client.post("/v1/events", json={"endpoint_id": endpoint_id, "payload": payload}, headers=auth)
 
         start = time.monotonic()
         for _ in range(events):
@@ -88,6 +115,7 @@ def run(events: int, payload_kb: int, database_url: str, redis_url: str) -> dict
             r = client.post(
                 "/v1/events",
                 json={"endpoint_id": endpoint_id, "payload": payload},
+                headers=auth,
             )
             assert r.status_code == 201, r.text
             latencies.append((time.monotonic() - t0) * 1000)
