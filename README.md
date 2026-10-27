@@ -20,6 +20,12 @@ Newsletter receivers time out, SaaS endpoints 500, consumers redeploy mid-delive
 - `tests/test_correctness.py` — the concurrency tests that are designed to fail if the protection regresses
 - `scripts/load_test.py` — benchmark over the full authed ingest path (362.6 rps measured, details below)
 
+## Demo
+
+![HookFlow end-to-end demo](docs/demo.gif)
+
+Recorded live from this repo with no external services: migrations, server boot, admin tenant + API key, endpoint registration, ingest, and two submissions sharing an `Idempotency-Key` — the duplicate gets the same `201` and the same event id back, and stats reports `queued: 1`.
+
 ## Problem
 
 Webhook receivers time out, return 5xx, and go away mid-deploy. Producers that
