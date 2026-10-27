@@ -2,11 +2,23 @@
 
 [![ci](https://github.com/sajadinmaker/hookflow/actions/workflows/ci.yml/badge.svg)](https://github.com/sajadinmaker/hookflow/actions/workflows/ci.yml)
 
-Reliable webhook and event delivery infrastructure.
+**Webhooks that survive your customer's worst day.**
 
-Accept an event durably, then deliver it with retries, signatures, and a
-dead-letter state — so a flaky consumer degrades into a queued retry instead of
-a lost event.
+Newsletter receivers time out, SaaS endpoints 500, consumers redeploy mid-delivery. HookFlow accepts each event durably *first*, then delivers it signed, with exponential backoff, idempotency keys, per-endpoint rate limits, and a dead-letter queue with one-click replay. A flaky consumer degrades into a scheduled retry instead of a lost event.
+
+| | |
+|---|---|
+| Stack | Python, FastAPI, PostgreSQL, optional Redis; Next.js operator dashboard |
+| Correctness | 79 tests, 93% coverage, mutation-verified concurrency tests |
+| CI | Every push runs the suite on SQLite, PostgreSQL, and Redis |
+| Dev mode | Zero external services: SQLite, in-process queue, published dev key that `/ready` flags |
+
+**Where to look first**
+
+- `app/worker.py` — the claim-and-lease delivery loop (PostgreSQL `SKIP LOCKED`, expired-lease rescue)
+- `app/crypto.py` — webhook payloads signed with HMAC-SHA256; secrets Fernet-encrypted at rest
+- `tests/test_correctness.py` — the concurrency tests that are designed to fail if the protection regresses
+- `scripts/load_test.py` — benchmark over the full authed ingest path (362.6 rps measured, details below)
 
 ## Problem
 
